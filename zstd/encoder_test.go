@@ -551,8 +551,10 @@ func TestEncoder_EncoderPi(t *testing.T) {
 }
 
 func TestEncoder_EncoderSilesia(t *testing.T) {
-	testEncoderRoundtrip(t, "testdata/silesia.tar", []byte{0xa5, 0x5b, 0x5e, 0xe, 0x5e, 0xea, 0x51, 0x6b})
-	testEncoderRoundtripWriter(t, "testdata/silesia.tar", []byte{0xa5, 0x5b, 0x5e, 0xe, 0x5e, 0xea, 0x51, 0x6b})
+	// sealed build: xxhash of the deterministic silesia.tar built by the extended-tests job in .github/workflows/go.yml
+	// (upstream's own tarball at files.klauspost.com is gone, so its hash 0xa5,0x5b,... cannot be reproduced).
+	testEncoderRoundtrip(t, "testdata/silesia.tar", []byte{0xa2, 0x53, 0x73, 0x38, 0x9e, 0x5a, 0xf0, 0x9f})
+	testEncoderRoundtripWriter(t, "testdata/silesia.tar", []byte{0xa2, 0x53, 0x73, 0x38, 0x9e, 0x5a, 0xf0, 0x9f})
 }
 
 func TestEncoder_EncoderSimple(t *testing.T) {

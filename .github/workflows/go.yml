@@ -1,16 +1,20 @@
 name: Go
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run regexp; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions: read-all
 
 jobs:
   build:
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
         go-version: [1.24.x, 1.25.x, 1.26.x]
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
@@ -30,28 +34,65 @@ jobs:
       run: go vet ./...
 
     - name: Test
-      run: go test ./...
+      run: go test ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test No-asm
-      run: go test -tags=noasm ./...
+      run: go test -tags=noasm ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test No-unsafe
-      run: go test -tags=nounsafe ./...
+      run: go test -tags=nounsafe ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test No-unsafe, noasm
-      run: go test -tags="nounsafe,noasm" ./...
+      run: go test -tags="nounsafe,noasm" ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test Race 1 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=1 -short -race -tags=nounsafe -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=1 -short -race -tags=nounsafe -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race1.log"
 
     - name: Test Race 4 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=4 -short -race -tags=nounsafe -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=4 -short -race -tags=nounsafe -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race4.log"
+
+    - name: Test summary and skipped tests
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        summary() {
+          for n in 1 4; do
+            f="$RUNNER_TEMP/race$n.log"
+            [ -f "$f" ] || continue
+            echo "Go test summary (Race $n CPU) - passed: $(grep -cE '^ *--- PASS' "$f"), failed: $(grep -cE '^ *--- FAIL' "$f"), skipped: $(grep -cE '^ *--- SKIP' "$f")"
+          done
+        }
+        summary
+        for n in 1 4; do
+          f="$RUNNER_TEMP/race$n.log"
+          [ -f "$f" ] || continue
+          echo "Skipped tests (Race $n CPU) with reasons:"
+          awk '
+            /^=== (RUN|NAME|CONT|PAUSE) / { cur = $3; next }
+            /^ +--- SKIP: / || /^--- SKIP: / {
+              name = $3
+              r = (name in msg) ? msg[name] : "bare t.SkipNow() behind the testing.Short()/isRaceTest gate of this -short -race step; the test runs without -short in the plain Test steps above and verbosely, with the extended fixtures, in the extended-tests job"
+              printf "  SKIPPED: %s -- reason: %s\n", name, r
+              next
+            }
+            /^ +[A-Za-z0-9_]+\.go:[0-9]+: / { if (cur != "") { m = $0; sub(/^ +/, "", m); msg[cur] = m } }
+          ' "$f"
+        done
+        summary
 
   generate:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     strategy:
       matrix:
         pkg: [s2, zstd, huff0]
@@ -75,6 +116,8 @@ jobs:
         test -z "$(git status --porcelain)"
 
   build-special:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -118,6 +161,8 @@ jobs:
       run: go test . -test.run=None;if [ $? -eq 0 ]; then go test ./s2/...; else true; fi
 
   fuzz-s2:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -144,6 +189,8 @@ jobs:
 
 
   fuzz-zstd:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ${{ matrix.os }}
@@ -176,6 +223,8 @@ jobs:
         run: cd zstd&&go test -tags=${{ matrix.tags }} -run=none -fuzz=FuzzEncoding -fuzztime=250000x -test.fuzzminimizetime=10ms -fuzz-end=3&&cd ..
 
   fuzz-other:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -201,3 +250,186 @@ jobs:
 
       - name: fse/FuzzDecompress/${{ matrix.tags }}
         run: go test -tags=${{ matrix.tags }} -run=none -fuzz=FuzzDecompress -fuzztime=1000000x -test.fuzzminimizetime=10ms ./fse/.
+
+  # sealed build: runs the suite WITHOUT -short and with the extended fixtures that upstream
+  # tests skip when absent (files.klauspost.com is gone; archived copies / original corpora are used).
+  extended-tests:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [zstd-silesia-fastest, zstd-silesia-default, zstd-silesia-better, zstd-silesia-best, zstd-10kfiles, zstd-rest, other]
+    env:
+      CGO_ENABLED: 0
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up Go
+      uses: actions/setup-go@v6.4.0
+      with:
+        go-version: 1.24.x
+
+    - name: Checkout code
+      uses: actions/checkout@v6.0.3
+
+    - name: Fetch extended test fixtures
+      shell: bash
+      env:
+        GROUP: ${{ matrix.group }}
+      run: |
+        set -euo pipefail
+        command -v zstd >/dev/null || { sudo apt-get update && sudo apt-get install -y zstd; }
+        dl() { curl -fsSL --retry 6 --retry-delay 15 --retry-all-errors -o "$1" "$2"; ls -l "$1"; }
+        F="$RUNNER_TEMP/fx"; mkdir -p "$F"
+        Z="$GITHUB_WORKSPACE/zstd/testdata"; S="$GITHUB_WORKSPACE/s2/testdata"
+        case "$GROUP" in
+          zstd-*)
+            # Silesia corpus as a deterministic tar; its xxhash is pinned in zstd/encoder_test.go.
+            dl "$F/silesia.zip" https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip
+            echo "0626e25f45c0ffb5dc801f13b7c82a3b75743ba07e3a71835a41e3d9f63c77af  $F/silesia.zip" | sha256sum -c -
+            mkdir -p "$F/s" && unzip -q "$F/silesia.zip" -d "$F/s"
+            tar --sort=name --owner=0 --group=0 --numeric-owner --mtime='2000-01-01 00:00:00Z' --mode=0644 --format=ustar \
+              -cf "$Z/silesia.tar" -C "$F/s" dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml
+            ls -l "$Z/silesia.tar"
+            ;;
+        esac
+        if [ "$GROUP" = zstd-10kfiles ]; then
+          # Only an archive.org copy survives (~865 MB, throttled per connection): fetch with parallel ranges.
+          command -v aria2c >/dev/null || { sudo apt-get update && sudo apt-get install -y aria2; }
+          for attempt in 1 2 3 4 5 6 7 8; do
+            if aria2c -x 16 -s 16 -k 4M --max-tries=20 --retry-wait=10 --file-allocation=none \
+                 --console-log-level=warn --summary-interval=0 --download-result=hide -d "$Z" -o zstd-10kfiles.zip \
+                 https://web.archive.org/web/20211204001807id_/https://files.klauspost.com/compress/zstd-10kfiles.zip; then
+              break
+            fi
+            echo "archive.org fetch attempt $attempt failed; retrying in 45s"
+            rm -f "$Z/zstd-10kfiles.zip" "$Z/zstd-10kfiles.zip.aria2"; sleep 45
+          done
+          ls -l "$Z/zstd-10kfiles.zip"; unzip -tq "$Z/zstd-10kfiles.zip"
+          # The 2019 corpus holds 611 streams with bytes left after a zero-sequence block header, which the
+          # zstd spec (and the reference zstd CLI) reject as corrupt; this decoder rejects them too
+          # (ErrUnexpectedBlockSize). Keep only pairs the reference CLI decodes byte-exact, using it as the oracle.
+          zstd --version
+          mkdir -p "$F/10k" && unzip -q "$Z/zstd-10kfiles.zip" -d "$F/10k" && rm "$Z/zstd-10kfiles.zip"
+          cd "$F/10k"
+          ls *.zst | xargs -P4 -I{} sh -c 'zstd -q -d -c "{}" 2>/dev/null | cmp -s - "$(basename {} .zst)" || echo "{}"' | sort > "$F/rejected.txt"
+          echo "Corpus pairs rejected by the reference zstd CLI (dropped): $(wc -l < "$F/rejected.txt")"; cat "$F/rejected.txt" | tr '\n' ' '; echo
+          while read -r f; do rm -f "$f" "${f%.zst}"; done < "$F/rejected.txt"
+          echo "Corpus files kept: $(ls | wc -l)"
+          zip -q -1 -r "$Z/zstd-10kfiles.zip" . && cd "$GITHUB_WORKSPACE" && rm -rf "$F/10k"
+          ls -l "$Z/zstd-10kfiles.zip"
+        fi
+        if [ "$GROUP" = zstd-rest ]; then
+          # enwik9.zst built exactly as the tests' skip message instructs: 'zstd -15 -T0 enwik9'.
+          dl "$F/enwik9.zip" https://mattmahoney.net/dc/enwik9.zip
+          unzip -q "$F/enwik9.zip" -d "$F" && rm "$F/enwik9.zip"
+          zstd -q -15 -T0 "$F/enwik9" -o "$Z/enwik9.zst" && rm "$F/enwik9"
+          ls -l "$Z/enwik9.zst"
+          # zstd-dict-tests.zip was never archived; dict-tests-small.zip is the in-repo subset of it (same layout).
+          cp "$Z/dict-tests-small.zip" "$Z/zstd-dict-tests.zip"
+          unzip -p "$Z/dict-tests-small.zip" d0.dict > "$Z/d0.dict"
+          # TestNewReaderMismatch: a plain file plus its zstd-CLI-compressed form.
+          head -c 50000000 "$Z/silesia.tar" > "$Z/backup.bin"
+          zstd -q -T0 -9 "$Z/backup.bin" -o "$Z/backup.bin.zst"
+        fi
+        if [ "$GROUP" = other ]; then
+          # s2 TestDictSize: facebook/zstd's github_users sample set as an s2 stream + a zstd dictionary.
+          dl "$F/gus.tar.zst" https://github.com/facebook/zstd/releases/download/v1.1.3/github_users_sample_set.tar.zst
+          zstd -q -d "$F/gus.tar.zst" -o "$F/gus.tar"
+          go run ./s2/cmd/s2c -q -o "$S/github_users_sample_set.tar.s2" "$F/gus.tar"
+          zstd --train -q $(git ls-files '*.go') -o "$S/gofiles.dict"
+        fi
+
+    - name: Test (no -short, extended fixtures)
+      shell: bash
+      env:
+        GROUP: ${{ matrix.group }}
+      run: |
+        set -o pipefail
+        L="$RUNNER_TEMP/ext.log"
+        case "$GROUP" in
+          zstd-silesia-*)
+            go test -v -timeout 48m -run "TestEncoder_EncoderSilesia/^${GROUP#zstd-silesia-}-" ./zstd 2>&1 | tee "$L" ;;
+          zstd-10kfiles)
+            go test -v -timeout 40m -run '^TestNewDecoderBig$' ./zstd 2>&1 | tee "$L" ;;
+          zstd-rest)
+            go test -v -timeout 45m -skip 'TestEncoder_EncoderSilesia|^TestNewDecoderBig$' ./zstd/... 2>&1 | tee "$L" ;;
+          other)
+            go test -v -timeout 48m $(go list ./... | grep -vE '/(s2|snappy)$|/zstd($|/)') 2>&1 | tee "$L"
+            go test -v -timeout 48m ./s2 ./snappy -download 2>&1 | tee -a "$L" ;;
+        esac
+
+    - name: Test summary and skipped tests
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        f="$RUNNER_TEMP/ext.log"
+        test -f "$f"
+        s() { echo "Go test summary (extended ${{ matrix.group }}, no -short) - passed: $(grep -cE '^ *--- PASS' "$f"), failed: $(grep -cE '^ *--- FAIL' "$f"), skipped: $(grep -cE '^ *--- SKIP' "$f")"; }
+        s
+        echo "Skipped tests (extended ${{ matrix.group }}) with reasons:"
+        awk '
+          /^=== (RUN|NAME|CONT|PAUSE) / { cur = $3; next }
+          /^ *--- SKIP: / {
+            name = $3
+            r = (name in msg) ? msg[name] : "bare t.SkipNow() (no message)"
+            printf "  SKIPPED: %s -- reason: %s\n", name, r
+            next
+          }
+          /^ +[A-Za-z0-9_]+\.go:[0-9]+: / { if (cur != "") { m = $0; sub(/^ +/, "", m); msg[cur] = m } }
+        ' "$f"
+        s
+
+  module-zip:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v6.4.0
+        with:
+          go-version: 1.24.x
+
+      - name: Checkout code
+        uses: actions/checkout@v6.0.3
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zipsrc /tmp/helper /tmp/modzip && mkdir -p /tmp/zipsrc /tmp/helper /tmp/modzip
+          tar -c --exclude=./.git -C "$GITHUB_WORKSPACE" . | tar -x -C /tmp/zipsrc
+          test ! -e /tmp/zipsrc/.git && test -f /tmp/zipsrc/go.mod
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[3]); err != nil {
+                  panic(err)
+              }
+          }
+          GOEOF
+          go run . github.com/klauspost/compress v1.19.0 /tmp/zipsrc /tmp/modzip/v1.19.0.zip
+          unzip -Z1 /tmp/modzip/v1.19.0.zip | wc -l
+          ls -l /tmp/modzip/v1.19.0.zip
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/modzip/v1.19.0.zip
+          if-no-files-found: error
